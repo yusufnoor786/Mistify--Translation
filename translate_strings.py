@@ -59,7 +59,10 @@ ROUNDS = int(os.environ.get("ROUNDS", "4"))
 # (each already retried ~30s), give up this pass instead of grinding for hours.
 ABORT_AFTER = int(os.environ.get("ABORT_AFTER", "6"))
 # Google allows ~5 requests/second per IP. Stay well under it (shared by all workers).
+ENGINE = (os.environ.get("ENGINE") or "google").strip().lower()   # google | argos
 REQ_PER_SEC = float(os.environ.get("REQ_PER_SEC", "3"))
+if ENGINE == "argos":
+    REQ_PER_SEC = 1000.0     # offline model: no server, no rate limit
 _rate_lock = threading.Lock()
 _next_slot = [0.0]
 _health_lock = threading.Lock()
@@ -106,6 +109,37 @@ def load_glossary():
 def make_translator(code):
     from deep_translator import GoogleTranslator
     return GoogleTranslator(source="en", target=code).translate
+
+
+_argos_cache = {}
+_argos_lock = threading.Lock()
+
+
+def make_translator_argos(code):
+    """Offline engine (Argos Translate). Downloads a small model once, then runs
+    locally: no API, no rate limits, no IP blocks. Quality is below Google's."""
+    if code in _argos_cache:
+        return _argos_cache[code]
+    import argostranslate.package as pkg
+    import argostranslate.translate as tr
+    with _argos_lock:
+        if code not in _argos_cache:
+            have = [p for p in pkg.get_installed_packages()
+                    if p.from_code == "en" and p.to_code == code]
+            if not have:
+                print(f"  Downloading offline model en->{code} ...", flush=True)
+                pkg.update_package_index()
+                match = next((p for p in pkg.get_available_packages()
+                              if p.from_code == "en" and p.to_code == code), None)
+                if match is None:
+                    raise RuntimeError(f"no offline model for en->{code}")
+                pkg.install_from_path(match.download())
+
+            def fn(text, _code=code):
+                with _argos_lock:               # one translation at a time (CPU bound)
+                    return tr.translate(text, "en", _code)
+            _argos_cache[code] = fn
+    return _argos_cache[code]
 
 
 # ---------------------------------------------------------------- protection
@@ -399,7 +433,9 @@ def summary(line):
             f.write(line + "\n")
 
 
-def main(argv, factory=make_translator):
+def main(argv, factory=None):
+    if factory is None:
+        factory = make_translator_argos if ENGINE == "argos" else make_translator
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(line_buffering=True)   # live logs in GitHub Actions
     if "--list" in argv:
@@ -418,7 +454,7 @@ def main(argv, factory=make_translator):
     if not sources:
         print(f"No res/values/{STRING_FILES} found under", Path.cwd())
         return 1
-    print("Source files:", ", ".join(p.as_posix() for p in sources))
+    print("Engine:", ENGINE, "| Source files:", ", ".join(p.as_posix() for p in sources))
     load_glossary()
     deadline = time.time() + MAX_MINUTES * 60
     rc = 0
