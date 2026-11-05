@@ -74,7 +74,7 @@ jobs:
   translate:
     needs: setup
     runs-on: ubuntu-latest
-    timeout-minutes: 340
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       max-parallel: 6            # be gentle with the free endpoint
@@ -104,7 +104,8 @@ jobs:
         working-directory: repo
         env:
           WORKERS: "4"
-          MAX_MINUTES: "300"
+          MAX_MINUTES: "90"
+          PYTHONUNBUFFERED: "1"
           ROUNDS: "4"
           GLOSSARY_FILE: ${{ github.workspace }}/tool/translate_glossary.txt
         # exits 1 if ANY string is missing or the translator returned English
