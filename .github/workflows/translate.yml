@@ -1,0 +1,172 @@
+name: Auto-translate strings
+
+# 100% free: keyless Google Translate via deep-translator. No secrets needed.
+#
+# Start it from  Actions -> "Auto-translate strings" -> Run workflow.
+# It asks which branch to translate. Results are NEVER pushed to that branch:
+# they go to a brand-new branch  n/1, n/2, n/3 ...  (next free number), with one
+# commit per language. If any language is incomplete, nothing is pushed.
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to translate (source branch), e.g. main"
+        required: true
+        default: "main"
+        type: string
+      langs:
+        description: "Language suffixes (blank = all: es de ru fil ar id)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: auto-translate
+  cancel-in-progress: false
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      langs: ${{ steps.l.outputs.langs }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - id: l
+        env:
+          INPUT_LANGS: ${{ inputs.langs }}
+        run: |
+          if [ -n "$INPUT_LANGS" ]; then
+            LANGS=$(python3 -c "import json,os; print(json.dumps(os.environ['INPUT_LANGS'].replace(',', ' ').split()))")
+          else
+            LANGS=$(python3 translate_strings.py --list)
+          fi
+          echo "langs=$LANGS" >> "$GITHUB_OUTPUT"
+          echo "Source branch: ${{ inputs.branch }}  |  Languages: $LANGS"
+
+  translate:
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      max-parallel: 6            # be gentle with the free endpoint
+      matrix:
+        lang: ${{ fromJson(needs.setup.outputs.langs) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Show target repo and branch
+        run: |
+          echo "Repo:   ${GITHUB_REPOSITORY}"
+          echo "Source: ${{ inputs.branch }}"
+          echo "Lang:   ${{ matrix.lang }}"
+
+      - run: pip install deep-translator
+
+      - name: Translate new / changed strings (${{ matrix.lang }})
+        env:
+          WORKERS: "4"
+          MAX_MINUTES: "300"
+          ROUNDS: "4"
+        # exits 1 if ANY string is missing or the translator returned English
+        run: python translate_strings.py "${{ matrix.lang }}"
+
+      - name: Package results
+        run: |
+          git ls-files -m -o --exclude-standard | grep -v '__pycache__' > "$RUNNER_TEMP/changed.txt" || true
+          if [ -s "$RUNNER_TEMP/changed.txt" ]; then
+            tar czf "$RUNNER_TEMP/tr-${{ matrix.lang }}.tgz" -T "$RUNNER_TEMP/changed.txt"
+          else
+            mkdir -p "$RUNNER_TEMP/empty"
+            tar czf "$RUNNER_TEMP/tr-${{ matrix.lang }}.tgz" -C "$RUNNER_TEMP/empty" .
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tr-${{ matrix.lang }}
+          path: ${{ runner.temp }}/tr-${{ matrix.lang }}.tgz
+          if-no-files-found: error
+          retention-days: 3
+
+  publish:
+    needs: [setup, translate]      # runs only if EVERY language succeeded
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: tr-*
+          path: ${{ runner.temp }}/tr
+
+      - name: Create next n/<number> branch, one commit per language
+        env:
+          SRC_BRANCH: ${{ inputs.branch }}
+          LANGS_JSON: ${{ needs.setup.outputs.langs }}
+        run: |
+          set -euo pipefail
+          git config user.name  "Zabuka_zuzu"
+          git config user.email "zuzu950444@gmail.com"
+
+          # First free number: n/1 if it doesn't exist, else n/2, else n/3 ...
+          EXISTING=$(git ls-remote --heads origin 'refs/heads/n/*' | sed 's#.*refs/heads/##' || true)
+          N=1
+          while grep -qxF "n/$N" <<< "$EXISTING"; do N=$((N + 1)); done
+          NEW="n/$N"
+          START=$(git rev-parse HEAD)
+          git checkout -b "$NEW"
+
+          for L in $(python3 -c 'import json,os; print(" ".join(json.loads(os.environ["LANGS_JSON"])))'); do
+            NAME=$(python3 translate_strings.py --name "$L")
+            tar xzf "$RUNNER_TEMP/tr/tr-$L/tr-$L.tgz" -C .
+            git add -A
+            if git diff --cached --quiet; then
+              echo "No new strings for $NAME ($L) - no commit."
+              continue
+            fi
+            COUNT=$(git diff --cached -U0 -- '*strings.xml' | grep -cE '^\+.*<(string|string-array|plurals) ' || true)
+            git commit -q \
+              -m "Add $NAME ($L) translations" \
+              -m "Auto-translated $COUNT string(s) from res/values/strings.xml with deep-translator (free Google Translate endpoint). Placeholders and glossary terms preserved. Incremental state: .translate-state/$L.json"
+            echo "Committed $NAME ($L): $COUNT string(s)"
+          done
+
+          if [ "$(git rev-parse HEAD)" = "$START" ]; then
+            echo "Nothing new to translate - no branch created."
+            echo "Nothing new to translate on \`$SRC_BRANCH\` - no branch created." >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+            exit 0
+          fi
+
+          git push origin "$NEW"
+          {
+            echo "### ✅ Pushed \`$NEW\` (from \`$SRC_BRANCH\`)"
+            git log --oneline "$START..HEAD"
+            echo ""
+            echo "Open a PR: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/${SRC_BRANCH}...${NEW}"
+            echo ""
+            echo "Tip: to keep it incremental, run the workflow next time with branch = \`$NEW\` (or merge it first)."
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          echo "Pushed $NEW"
