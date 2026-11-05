@@ -54,6 +54,8 @@ GLOSSARY_FILE = Path(os.environ.get("GLOSSARY_FILE") or "translate_glossary.txt"
 WORKERS = int(os.environ.get("WORKERS", "4"))
 MAX_MINUTES = float(os.environ.get("MAX_MINUTES", "300"))
 ROUNDS = int(os.environ.get("ROUNDS", "4"))
+# Which files in res/values/ to translate (comma-separated globs).
+STRING_FILES = os.environ.get("STRING_FILES") or "*strings*.xml"
 
 BLOCK_RE = re.compile(r"<(string|string-array|plurals)\b([^>]*?)>(.*?)</\1>", re.DOTALL)
 ITEM_RE = re.compile(r"(<item\b[^>]*>)(.*?)(</item>)", re.DOTALL)
@@ -241,7 +243,7 @@ def save_state(suffix, state):
 
 # ------------------------------------------------------------------- per file
 def process(src, suffix, code, factory, state, deadline):
-    target = src.parent.parent / f"values-{suffix}" / "strings.xml"
+    target = src.parent.parent / f"values-{suffix}" / src.name   # same file name
     raw_src = src.read_text(encoding="utf-8")
     tgt_text = target.read_text(encoding="utf-8") if target.exists() else None
     have = names_in(tgt_text) if tgt_text else set()
@@ -316,9 +318,20 @@ def process(src, suffix, code, factory, state, deadline):
     return {"ok": ok, "bad": bad, "pruned": pruned, "suspicious": suspicious}
 
 
+def find_sources():
+    """Every res/values/<STRING_FILES>.xml (default: any file with 'strings' in
+    its name, e.g. strings.xml, mist_strings.xml, mist_bar_strings.xml)."""
+    found = set()
+    for pat in [p.strip() for p in STRING_FILES.split(",") if p.strip()]:
+        for p in Path(".").rglob(f"res/values/{pat}"):
+            if p.is_file() and not (set(p.parts) & SKIP_DIRS):
+                found.add(p)
+    return sorted(found)
+
+
 def missing_strings(src, suffix):
     """Names of translatable English strings that have no entry in the target."""
-    target = src.parent.parent / f"values-{suffix}" / "strings.xml"
+    target = src.parent.parent / f"values-{suffix}" / src.name
     have = names_in(target.read_text(encoding="utf-8")) if target.exists() else set()
     return [n for _, _, _, n in blocks_of(src.read_text(encoding="utf-8")) if n not in have]
 
@@ -343,33 +356,33 @@ def main(argv, factory=make_translator):
         print("Unknown language suffix(es):", unknown, "- choose from", list(LANGUAGES))
         return 1
     langs = {k: v for k, v in LANGUAGES.items() if not wanted or k in wanted}
-    sources = sorted(
-        p for p in Path(".").rglob("res/values/strings.xml")
-        if not (set(p.parts) & SKIP_DIRS)
-    )
+    sources = find_sources()
     if not sources:
-        print("No res/values/strings.xml found under", Path.cwd())
+        print(f"No res/values/{STRING_FILES} found under", Path.cwd())
         return 1
+    print("Source files:", ", ".join(p.as_posix() for p in sources))
     load_glossary()
     deadline = time.time() + MAX_MINUTES * 60
     rc = 0
     for suffix, code in langs.items():
         state = load_state(suffix)
-        total_ok = total_pruned = 0
+        total_ok = 0
         suspicious = []
         for src in sources:
+            file_ok = file_pruned = 0
             for rnd in range(1, ROUNDS + 1):
                 r = process(src, suffix, code, factory, state, deadline)
-                total_ok += r["ok"]
-                total_pruned += r["pruned"]
-                suspicious += [f"{src.parent.parent.parent.name}:{n}" for n in r["suspicious"]]
+                file_ok += r["ok"]
+                file_pruned += r["pruned"]
+                suspicious += [f"{src.name}:{n}" for n in r["suspicious"]]
                 save_state(suffix, state)       # save after every pass -> resumable
                 if r["bad"] == 0:
                     break
                 print(f"  round {rnd}/{ROUNDS}: {r['bad']} string(s) failed, retrying...")
                 time.sleep(min(20 * rnd, 60))
+            total_ok += file_ok
             miss = missing_strings(src, suffix)
-            print(f"[{suffix}] {src}: +{total_ok} translated, {total_pruned} removed, "
+            print(f"[{suffix}] {src}: +{file_ok} translated, {file_pruned} removed, "
                   f"{len(miss)} missing")
             if miss:
                 rc = 1
