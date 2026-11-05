@@ -50,7 +50,7 @@ LANG_NAMES = {"es": "Spanish", "de": "German", "ru": "Russian",
 
 SKIP_DIRS = {"build", ".git", "out", "node_modules", ".gradle"}
 STATE_DIR = Path(".translate-state")
-GLOSSARY_FILE = Path("translate_glossary.txt")
+GLOSSARY_FILE = Path(os.environ.get("GLOSSARY_FILE") or "translate_glossary.txt")
 WORKERS = int(os.environ.get("WORKERS", "4"))
 MAX_MINUTES = float(os.environ.get("MAX_MINUTES", "300"))
 ROUNDS = int(os.environ.get("ROUNDS", "4"))
