@@ -22,6 +22,14 @@ on:
         required: false
         default: ""
         type: string
+      engine:
+        description: "google = best quality (default). argos = offline, use if Google blocks GitHub"
+        required: true
+        default: "google"
+        type: choice
+        options:
+          - google
+          - argos
 
 permissions:
   contents: read
@@ -87,9 +95,12 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.11"
 
-      - run: pip install deep-translator
+      - name: Install translator
+        run: |
+          pip install deep-translator
+          if [ "${{ inputs.engine }}" = "argos" ]; then pip install argostranslate; fi
 
       - name: Clone the GitLab repo
         env:
@@ -106,6 +117,7 @@ jobs:
           WORKERS: "3"
           MAX_MINUTES: "90"
           PYTHONUNBUFFERED: "1"
+          ENGINE: ${{ inputs.engine }}
           ROUNDS: "4"
           GLOSSARY_FILE: ${{ github.workspace }}/tool/translate_glossary.txt
         # exits 1 if ANY string is missing or the translator returned English
