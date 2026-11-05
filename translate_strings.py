@@ -32,6 +32,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -52,8 +53,13 @@ SKIP_DIRS = {"build", ".git", "out", "node_modules", ".gradle"}
 STATE_DIR = Path(".translate-state")
 GLOSSARY_FILE = Path(os.environ.get("GLOSSARY_FILE") or "translate_glossary.txt")
 WORKERS = int(os.environ.get("WORKERS", "4"))
-MAX_MINUTES = float(os.environ.get("MAX_MINUTES", "300"))
+MAX_MINUTES = float(os.environ.get("MAX_MINUTES", "90"))
 ROUNDS = int(os.environ.get("ROUNDS", "4"))
+# Stop hammering a blocked endpoint: after this many strings in a row fail
+# (each already retried ~30s), give up this pass instead of grinding for hours.
+ABORT_AFTER = int(os.environ.get("ABORT_AFTER", "6"))
+_health_lock = threading.Lock()
+_health = {"fails": 0}
 # Which files in res/values/ to translate (comma-separated globs).
 STRING_FILES = os.environ.get("STRING_FILES") or "*strings*.xml"
 
@@ -133,7 +139,7 @@ def word_count(t):
 
 def request(translate, text):
     err = None
-    for attempt in range(6):
+    for attempt in range(5):
         try:
             out = translate(text)
             if out:
@@ -263,15 +269,31 @@ def process(src, suffix, code, factory, state, deadline):
         work.append((name, kind, attrs, inner, h, mode))
 
     memo = {}
+    progress = {"done": 0}
+    with _health_lock:
+        _health["fails"] = 0
 
     def run(item):
         name, kind, attrs, inner, h, mode = item
         if time.time() > deadline:
-            return item, None, "time budget reached"
-        try:
-            return item, translate_block(kind, attrs, inner, factory(code), memo), ""
-        except Exception as e:
-            return item, None, str(e)
+            res = (item, None, "time budget reached")
+        elif _health["fails"] >= ABORT_AFTER:
+            res = (item, None, "aborted early: translation service is rate-limiting/blocking requests")
+        else:
+            try:
+                res = (item, translate_block(kind, attrs, inner, factory(code), memo), "")
+                with _health_lock:
+                    _health["fails"] = 0
+            except Exception as e:
+                with _health_lock:
+                    _health["fails"] += 1
+                res = (item, None, str(e))
+        with _health_lock:
+            progress["done"] += 1
+            d = progress["done"]
+        if d % 100 == 0 or d == len(work):
+            print(f"  [{suffix}] {src.name}: {d}/{len(work)} processed", flush=True)
+        return res
 
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
         results = list(pool.map(run, work))
@@ -281,7 +303,10 @@ def process(src, suffix, code, factory, state, deadline):
     for (name, kind, attrs, inner, h, mode), block, why in results:
         if block is None:
             bad += 1
-            print(f"  ! {name}: {why}")
+            if bad <= 10:
+                print(f"  ! {name}: {why}", flush=True)
+            elif bad == 11:
+                print("  ! ... (further failures not listed)", flush=True)
             continue
         ok += 1
         st[name] = h
@@ -344,6 +369,8 @@ def summary(line):
 
 
 def main(argv, factory=make_translator):
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)   # live logs in GitHub Actions
     if "--list" in argv:
         print(json.dumps(list(LANGUAGES)))
         return 0
@@ -399,6 +426,11 @@ def main(argv, factory=make_translator):
                   f"right now - nothing should be pushed. Re-run later.")
             summary(f"❌ {LANG_NAMES.get(suffix, suffix)}: translator returned English for "
                     f"{len(suspicious)}/{total_ok} strings - failed on purpose, re-run later")
+    if rc:
+        print("\nSome strings were NOT translated, so nothing will be pushed. If you saw "
+              "'request failed' or 'aborted early' above, Google is rate-limiting this "
+              "machine's IP. Re-run later, or run the script on your own PC: "
+              "pip install deep-translator && python translate_strings.py", flush=True)
     return rc
 
 
