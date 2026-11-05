@@ -103,7 +103,7 @@ jobs:
       - name: Translate new / changed strings (${{ matrix.lang }})
         working-directory: repo
         env:
-          WORKERS: "4"
+          WORKERS: "3"
           MAX_MINUTES: "90"
           PYTHONUNBUFFERED: "1"
           ROUNDS: "4"
