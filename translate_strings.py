@@ -52,12 +52,16 @@ LANG_NAMES = {"es": "Spanish", "de": "German", "ru": "Russian",
 SKIP_DIRS = {"build", ".git", "out", "node_modules", ".gradle"}
 STATE_DIR = Path(".translate-state")
 GLOSSARY_FILE = Path(os.environ.get("GLOSSARY_FILE") or "translate_glossary.txt")
-WORKERS = int(os.environ.get("WORKERS", "4"))
+WORKERS = int(os.environ.get("WORKERS", "3"))
 MAX_MINUTES = float(os.environ.get("MAX_MINUTES", "90"))
 ROUNDS = int(os.environ.get("ROUNDS", "4"))
 # Stop hammering a blocked endpoint: after this many strings in a row fail
 # (each already retried ~30s), give up this pass instead of grinding for hours.
 ABORT_AFTER = int(os.environ.get("ABORT_AFTER", "6"))
+# Google allows ~5 requests/second per IP. Stay well under it (shared by all workers).
+REQ_PER_SEC = float(os.environ.get("REQ_PER_SEC", "3"))
+_rate_lock = threading.Lock()
+_next_slot = [0.0]
 _health_lock = threading.Lock()
 _health = {"fails": 0}
 # Which files in res/values/ to translate (comma-separated globs).
@@ -137,17 +141,44 @@ def word_count(t):
     return len(re.findall(r"[A-Za-z]{2,}", PROTECT_RE.sub(" ", t)))
 
 
+def throttle():
+    """Global rate limit: at most REQ_PER_SEC requests/second across all workers."""
+    with _rate_lock:
+        now = time.time()
+        start = max(now, _next_slot[0])
+        _next_slot[0] = start + 1.0 / REQ_PER_SEC
+    if start > now:
+        time.sleep(start - now)
+
+
+def cooldown(seconds):
+    """Make EVERY worker pause (not just the one that got the error)."""
+    with _rate_lock:
+        _next_slot[0] = max(_next_slot[0], time.time() + seconds)
+
+
+def is_rate_limited(e):
+    msg = str(e).lower()
+    return (type(e).__name__ == "TooManyRequests" or "too many requests" in msg
+            or "429" in msg or "rate" in msg and "limit" in msg)
+
+
 def request(translate, text):
     err = None
     for attempt in range(5):
+        throttle()
         try:
             out = translate(text)
             if out:
                 return out
             err = "empty response"
+            time.sleep(min(2 ** attempt, 30))
         except Exception as e:  # rate limit / network hiccup
             err = e
-        time.sleep(min(2 ** attempt, 30))
+            if is_rate_limited(e):
+                cooldown(min(10 * 2 ** attempt, 60))   # 10, 20, 40, 60, 60 s - all workers wait
+            else:
+                time.sleep(min(2 ** attempt, 30))
     raise RuntimeError(f"request failed: {err}")
 
 
