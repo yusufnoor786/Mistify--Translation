@@ -1,17 +1,19 @@
-name: Auto-translate strings
+name: Auto-translate GitLab repo strings
 
-# 100% free: keyless Google Translate via deep-translator. No secrets needed.
+# This workflow lives in a GitHub repo, but translates a repo that lives on GitLab.
+#   * Reads the GitLab repo (branch you type when starting the run)
+#   * Translates new/edited strings into es, de, ru, fil, ar, id  (free, no API key)
+#   * Pushes the result to a NEW branch in the GitLab repo: n/1, n/2, n/3 ...
+#     (first free number), one commit per language.
+#   * If any language is incomplete, nothing is pushed.
 #
-# Start it from  Actions -> "Auto-translate strings" -> Run workflow.
-# It asks which branch to translate. Results are NEVER pushed to that branch:
-# they go to a brand-new branch  n/1, n/2, n/3 ...  (next free number), with one
-# commit per language. If any language is incomplete, nothing is pushed.
+# One-time setup: add a GitHub secret named GITLAB_TOKEN (see README / chat steps).
 
 on:
   workflow_dispatch:
     inputs:
       branch:
-        description: "Branch to translate (source branch), e.g. main"
+        description: "GitLab branch to translate (source branch), e.g. main"
         required: true
         default: "main"
         type: string
@@ -22,7 +24,11 @@ on:
         type: string
 
 permissions:
-  contents: write
+  contents: read
+
+env:
+  # <-- your GitLab project path:  namespace/project
+  GITLAB_PROJECT: yusufnoor786/packages_apps_Mistify
 
 concurrency:
   group: auto-translate
@@ -36,7 +42,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.branch }}
+          path: tool
 
       - uses: actions/setup-python@v5
         with:
@@ -45,14 +51,25 @@ jobs:
       - id: l
         env:
           INPUT_LANGS: ${{ inputs.langs }}
+          SRC_BRANCH: ${{ inputs.branch }}
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
         run: |
+          if [ -z "$GITLAB_TOKEN" ]; then
+            echo "::error::GitHub secret GITLAB_TOKEN is missing. Add it in Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+          URL="https://oauth2:${GITLAB_TOKEN}@gitlab.com/${GITLAB_PROJECT}.git"
+          if ! git ls-remote --exit-code --heads "$URL" "refs/heads/${SRC_BRANCH}" >/dev/null 2>&1; then
+            echo "::error::Cannot read branch '${SRC_BRANCH}' of GitLab project ${GITLAB_PROJECT}. Check the branch name and that GITLAB_TOKEN is valid."
+            exit 1
+          fi
           if [ -n "$INPUT_LANGS" ]; then
             LANGS=$(python3 -c "import json,os; print(json.dumps(os.environ['INPUT_LANGS'].replace(',', ' ').split()))")
           else
-            LANGS=$(python3 translate_strings.py --list)
+            LANGS=$(python3 tool/translate_strings.py --list)
           fi
           echo "langs=$LANGS" >> "$GITHUB_OUTPUT"
-          echo "Source branch: ${{ inputs.branch }}  |  Languages: $LANGS"
+          echo "GitLab project: ${GITLAB_PROJECT} | source branch: ${SRC_BRANCH} | languages: $LANGS"
 
   translate:
     needs: setup
@@ -66,29 +83,35 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.branch }}
+          path: tool
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Show target repo and branch
-        run: |
-          echo "Repo:   ${GITHUB_REPOSITORY}"
-          echo "Source: ${{ inputs.branch }}"
-          echo "Lang:   ${{ matrix.lang }}"
-
       - run: pip install deep-translator
 
+      - name: Clone the GitLab repo
+        env:
+          SRC_BRANCH: ${{ inputs.branch }}
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+        run: |
+          git clone --quiet --depth 1 --branch "$SRC_BRANCH" \
+            "https://oauth2:${GITLAB_TOKEN}@gitlab.com/${GITLAB_PROJECT}.git" repo
+          echo "Translating GitLab project ${GITLAB_PROJECT} @ ${SRC_BRANCH} -> ${{ matrix.lang }}"
+
       - name: Translate new / changed strings (${{ matrix.lang }})
+        working-directory: repo
         env:
           WORKERS: "4"
           MAX_MINUTES: "300"
           ROUNDS: "4"
+          GLOSSARY_FILE: ${{ github.workspace }}/tool/translate_glossary.txt
         # exits 1 if ANY string is missing or the translator returned English
-        run: python translate_strings.py "${{ matrix.lang }}"
+        run: python "$GITHUB_WORKSPACE/tool/translate_strings.py" "${{ matrix.lang }}"
 
       - name: Package results
+        working-directory: repo
         run: |
           git ls-files -m -o --exclude-standard | grep -v '__pycache__' > "$RUNNER_TEMP/changed.txt" || true
           if [ -s "$RUNNER_TEMP/changed.txt" ]; then
@@ -111,7 +134,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.branch }}
+          path: tool
 
       - uses: actions/setup-python@v5
         with:
@@ -122,7 +145,16 @@ jobs:
           pattern: tr-*
           path: ${{ runner.temp }}/tr
 
-      - name: Create next n/<number> branch, one commit per language
+      - name: Clone the GitLab repo
+        env:
+          SRC_BRANCH: ${{ inputs.branch }}
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+        run: |
+          git clone --quiet --branch "$SRC_BRANCH" \
+            "https://oauth2:${GITLAB_TOKEN}@gitlab.com/${GITLAB_PROJECT}.git" repo
+
+      - name: Create next n/<number> branch on GitLab, one commit per language
+        working-directory: repo
         env:
           SRC_BRANCH: ${{ inputs.branch }}
           LANGS_JSON: ${{ needs.setup.outputs.langs }}
@@ -137,20 +169,20 @@ jobs:
           while grep -qxF "n/$N" <<< "$EXISTING"; do N=$((N + 1)); done
           NEW="n/$N"
           START=$(git rev-parse HEAD)
-          git checkout -b "$NEW"
+          git checkout -q -b "$NEW"
 
           for L in $(python3 -c 'import json,os; print(" ".join(json.loads(os.environ["LANGS_JSON"])))'); do
-            NAME=$(python3 translate_strings.py --name "$L")
+            NAME=$(python3 "$GITHUB_WORKSPACE/tool/translate_strings.py" --name "$L")
             tar xzf "$RUNNER_TEMP/tr/tr-$L/tr-$L.tgz" -C .
             git add -A
             if git diff --cached --quiet; then
               echo "No new strings for $NAME ($L) - no commit."
               continue
             fi
-            COUNT=$(git diff --cached -U0 -- '*strings.xml' | grep -cE '^\+.*<(string|string-array|plurals) ' || true)
+            COUNT=$(git diff --cached -U0 -- '*.xml' | grep -cE '^\+.*<(string|string-array|plurals) ' || true)
             git commit -q \
               -m "Add $NAME ($L) translations" \
-              -m "Auto-translated $COUNT string(s) from res/values/strings.xml with deep-translator (free Google Translate endpoint). Placeholders and glossary terms preserved. Incremental state: .translate-state/$L.json"
+              -m "Auto-translated $COUNT string(s) from the English res/values string files with deep-translator (free Google Translate endpoint). Placeholders and glossary terms preserved. Incremental state: .translate-state/$L.json"
             echo "Committed $NAME ($L): $COUNT string(s)"
           done
 
@@ -160,13 +192,13 @@ jobs:
             exit 0
           fi
 
-          git push origin "$NEW"
+          git push --quiet origin "$NEW"
           {
-            echo "### ✅ Pushed \`$NEW\` (from \`$SRC_BRANCH\`)"
+            echo "### ✅ Pushed \`$NEW\` to GitLab (${GITLAB_PROJECT}, from \`$SRC_BRANCH\`)"
             git log --oneline "$START..HEAD"
             echo ""
-            echo "Open a PR: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/${SRC_BRANCH}...${NEW}"
+            echo "Open a merge request: https://gitlab.com/${GITLAB_PROJECT}/-/merge_requests/new?merge_request%5Bsource_branch%5D=${NEW}&merge_request%5Btarget_branch%5D=${SRC_BRANCH}"
             echo ""
-            echo "Tip: to keep it incremental, run the workflow next time with branch = \`$NEW\` (or merge it first)."
+            echo "Tip: next time, run with branch = \`$NEW\` (or merge it first) so it stays incremental."
           } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
           echo "Pushed $NEW"
