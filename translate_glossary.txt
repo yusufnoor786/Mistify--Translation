@@ -1,0 +1,4 @@
+# Optional. One term per line that must NEVER be translated (brand / product names).
+# Lines starting with # are ignored. Delete this file if you don't need it.
+Mistify
+Mist
